@@ -48,19 +48,26 @@ class SalaryConsumer(Consumer):
         self.group_id = group_id
 
     def consume(self, topics, processing_func):
-        #implement your message processing logic here. Not necessary to follow the template. 
+        # Main consumer loop - polls messages and processes them
         try:
             self.subscribe(topics)
             while self.keep_runnning:
+                # Poll with 1 second timeout to balance responsiveness and CPU usage
                 msg = self.poll(timeout=1.0)
 
-                #can implement other logics for msg
-
-                if not msg:
-                    pass 
+                if msg is None:
+                    # No message available, continue polling
+                    continue
                 elif msg.error():
-                    pass
+                    if msg.error().code() == KafkaError._PARTITION_EOF:
+                        # Reached end of partition - informational, not an error
+                        sys.stderr.write('%% %s [%d] reached end at offset %d\n' %
+                                         (msg.topic(), msg.partition(), msg.offset()))
+                    elif msg.error():
+                        raise KafkaException(msg.error())
                 else:
+                    # Valid message received - process it
+                    print(f'Processing message: {msg.value()}')
                     processing_func(msg)
         finally:
             # Close down consumer to commit final offsets.
@@ -70,8 +77,10 @@ class SalaryConsumer(Consumer):
 class ConsumingMethods:
     @staticmethod
     def add_salary(msg):
+        # Deserialize JSON message to Employee object
         e = Employee(**(json.loads(msg.value())))
         try:
+            # Connect to PostgreSQL database
             conn = psycopg2.connect(
                 #use localhost if not run in Docker
                 host="0.0.0.0",
@@ -79,13 +88,36 @@ class ConsumingMethods:
                 user="postgres",
                 port = '5432',
                 password="postgres")
-            conn.autocommit = True
+            conn.autocommit = True  # Auto-commit for simplicity
             cur = conn.cursor()
-            #your logic goes here
+            
+            # Create table if not exists - idempotent operation
+            # Use department as PRIMARY KEY to ensure uniqueness
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS department_employee_salary (
+                    department VARCHAR(50) PRIMARY KEY,
+                    total_salary BIGINT DEFAULT 0
+                )
+            """)
+            
+            # Upsert pattern: Insert new dept or add salary to existing dept
+            # ON CONFLICT handles concurrent writes and aggregates salary per department
+            # This approach maintains running totals without needing to pre-aggregate
+            cur.execute(f"""
+                INSERT INTO department_employee_salary (department, total_salary) 
+                VALUES ('{e.emp_dept}', {int(float(e.emp_salary))}) 
+                ON CONFLICT(department) 
+                DO UPDATE SET total_salary = department_employee_salary.total_salary + {int(float(e.emp_salary))}
+            """)
+            
+            print(f"Added {e.emp_salary} to department {e.emp_dept}")
             cur.close()
         except Exception as err:
-            print(err)
+            # Log errors but continue processing - ensures one bad message doesn't stop consumer
+            print(f"Error processing message: {err}")
 
 if __name__ == '__main__':
-    consumer = SalaryConsumer(group_id=?) #what is the group id here?
-    consumer.consume([?],ConsumingMethods.add_salary) #what is the topic here?
+    # Use specific group_id to enable consumer group management and offset tracking
+    consumer = SalaryConsumer(group_id="employee_consumer_salary")
+    # Start consuming from the specified topic and process with add_salary function
+    consumer.consume([employee_topic_name], ConsumingMethods.add_salary)
