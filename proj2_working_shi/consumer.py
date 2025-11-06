@@ -25,13 +25,8 @@ THE SOFTWARE.
 
 
 import json
-import random
-import string
-import sys
 import psycopg2
-from confluent_kafka import Consumer, KafkaError, KafkaException
-from confluent_kafka.serialization import StringDeserializer
-from employee import Employee
+from confluent_kafka import Consumer, KafkaError
 from employee import Employee
 from producer import employee_topic_name
 
@@ -48,35 +43,78 @@ class cdcConsumer(Consumer):
         self.group_id = group_id
 
     def consume(self, topics, processing_func):
+        """
+        Standard Kafka consumer loop: poll messages and process them.
+        timeout=1.0 prevents blocking indefinitely when no messages available.
+        """
         try:
             self.subscribe(topics)
             while self.keep_runnning:
-                #implement your logic here
-
-                pass
+                msg = self.poll(timeout=1.0)
+                if msg is None:
+                    continue
+                if msg.error():
+                    if msg.error().code() == KafkaError._PARTITION_EOF:
+                        continue
+                    else:
+                        print(f"Consumer error: {msg.error()}")
+                        break
+                processing_func(msg)
         finally:
             self.close()
 
 def update_dst(msg):
+    """
+    Apply CDC changes to destination database based on action type.
+    Replicates INSERT/UPDATE/DELETE operations from source to target.
+    """
     e = Employee(**(json.loads(msg.value())))
     try:
         conn = psycopg2.connect(
             host="localhost",
             database="postgres",
             user="postgres",
-            port = '5433', # change this port number to align with the docker compose file
+            port='5433',  # Destination database port (different from source)
             password="postgres")
         conn.autocommit = True
         cur = conn.cursor()
-        #your logic goes here
-
-
-
-
+        
+        # Ensure target table exists (idempotent)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS employees (
+                emp_id INT PRIMARY KEY,
+                emp_FN VARCHAR(50),
+                emp_LN VARCHAR(50),
+                emp_dob DATE,
+                emp_city VARCHAR(50)
+            )
+        """)
+        
+        # Apply changes based on action type from CDC record
+        # This implements the core replication logic
+        if e.action == 'insert':
+            cur.execute("""
+                INSERT INTO employees (emp_id, emp_FN, emp_LN, emp_dob, emp_city)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (emp_id) DO NOTHING
+            """, (e.emp_id, e.emp_FN, e.emp_LN, e.emp_dob, e.emp_city))
+        elif e.action == 'update':
+            cur.execute("""
+                UPDATE employees
+                SET emp_FN = %s, emp_LN = %s, emp_dob = %s, emp_city = %s
+                WHERE emp_id = %s
+            """, (e.emp_FN, e.emp_LN, e.emp_dob, e.emp_city, e.emp_id))
+        elif e.action == 'delete':
+            cur.execute("""
+                DELETE FROM employees WHERE emp_id = %s
+            """, (e.emp_id,))
+        
+        print(f"Applied {e.action} for employee {e.emp_id}")
         cur.close()
+        conn.close()
     except Exception as err:
-        print(err)
+        print(f"Error updating destination: {err}")
 
 if __name__ == '__main__':
-    consumer = cdcConsumer(group_id=?) 
+    consumer = cdcConsumer(group_id='cdc_consumer_group')
     consumer.consume([employee_topic_name], update_dst)
